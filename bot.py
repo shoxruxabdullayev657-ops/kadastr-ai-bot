@@ -1,17 +1,24 @@
 import os
 import logging
 import sqlite3
+import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from collections import defaultdict, deque
 
 from dotenv import load_dotenv
 from openai import OpenAI
-from telegram import Update, ReplyKeyboardMarkup
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -20,28 +27,19 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna").strip()
-USE_WEB_SEARCH = os.getenv("USE_WEB_SEARCH", "true").lower() in {"1", "true", "yes", "on"}
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
-# 10 000 so'm = 1 savol
-QUESTION_PRICE_UZS = int(os.getenv("QUESTION_PRICE_UZS", "10000"))
-
-# Sizning Telegram user ID'ingiz. /myid orqali bilib olishingiz mumkin.
-ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "0") or "0")
-
-# To'lov uchun ko'rsatma. Masalan karta raqami yoki Click/Payme havolasi.
-PAYMENT_INSTRUCTIONS = os.getenv(
-    "PAYMENT_INSTRUCTIONS",
-    "To'lov uchun administrator bilan bog'laning. 1 ta savol narxi: 10 000 so'm."
-).strip()
+QUESTION_PRICE_UZS = 10000
+ADMIN_TELEGRAM_ID = 8875413772
+CARD_NUMBER = "9860060116463575"
 
 TZ = ZoneInfo("Asia/Samarkand")
 DB_PATH = os.getenv("DB_PATH", "kadastr_bot.db")
 
 if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN topilmadi. .env faylini tekshiring.")
+    raise RuntimeError("TELEGRAM_BOT_TOKEN topilmadi.")
 if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY topilmadi. .env faylini tekshiring.")
+    raise RuntimeError("OPENAI_API_KEY topilmadi.")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -66,10 +64,7 @@ ASOSIY VAZIFALAR:
 MUHIM:
 - O'zingizni davlat organi yoki rasmiy kadastr xodimi deb ko'rsatmang.
 - Qonun, to'lov, muddat yoki talab o'zgarishi mumkin bo'lsa, buni ayting.
-- Huquqiy nizoda qat'iy yuridik hukm bermang.
-- Zarur bo'lsa Kadastr agentligi, Davlat xizmatlari markazi, my.gov.uz yoki boshqa
-  amaldagi rasmiy manbani tekshirishni tavsiya qiling.
-- Pasport seriyasi, PINFL, bank karta raqami, parol kabi maxfiy ma'lumotlarni so'ramang.
+- Zarur bo'lsa Kadastr agentligi, Davlat xizmatlari markazi yoki my.gov.uz manbalarini tavsiya qiling.
 """
 
 history = defaultdict(lambda: deque(maxlen=16))
@@ -84,16 +79,14 @@ MENU = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-WELCOME = f"""Assalomu alaykum! 👋
+WELCOME = """Assalomu alaykum! 👋
 
 Men Kadastr AI yordamchisiman.
 
 ✅ Har kuni 1 ta savol BEPUL.
-💳 Shu kundagi keyingi har bir savol: {QUESTION_PRICE_UZS:,} so'm.
+💳 Shu kundagi keyingi har bir savol: 10 000 so'm.
 
-Savolingizni yozing yoki menyudan tanlang.
-
-Eslatma: javoblar ma'lumot va yo'l-yo'riq uchun. Yakuniy talablar rasmiy tartibga bog'liq bo'lishi mumkin.""".replace(",", " ")
+Savolingizni yozing yoki quyidagi menyudan tanlang."""
 
 def db():
     conn = sqlite3.connect(DB_PATH)
@@ -177,7 +170,6 @@ def consume_question(user_id: int, mode: str):
         conn.commit()
 
 def refund_question(user_id: int, mode: str):
-    # AI texnik xato bersa foydalanuvchining bepul/pullik haqqini qaytaramiz.
     with db() as conn:
         if mode == "free":
             conn.execute(
@@ -215,26 +207,20 @@ def balance_text(user_id: int):
         f"💰 Balansingiz:\n\n"
         f"🎁 Bugungi bepul savol: {'mavjud ✅' if free_available else 'ishlatilgan ❌'}\n"
         f"💳 Pullik savollar: {acc['paid_credits']} ta\n"
-        f"💵 1 ta qo‘shimcha savol: {QUESTION_PRICE_UZS:,} so‘m"
-    ).replace(",", " ")
-
-def build_input(chat_id: int, user_text: str):
-    messages = list(history[chat_id])
-    messages.append({"role": "user", "content": user_text})
-    return messages
+        f"💵 1 ta qo‘shimcha savol: 10 000 so‘m"
+    )
 
 def ask_openai(chat_id: int, user_text: str) -> str:
-    kwargs = {
-        "model": OPENAI_MODEL,
-        "instructions": SYSTEM_PROMPT,
-        "input": build_input(chat_id, user_text),
-        "store": False,
-    }
-    if USE_WEB_SEARCH:
-        kwargs["tools"] = [{"type": "web_search"}]
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for msg in history[chat_id]:
+        messages.append(msg)
+    messages.append({"role": "user", "content": user_text})
 
-    response = client.responses.create(**kwargs)
-    answer = (response.output_text or "").strip()
+    response = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=messages,
+    )
+    answer = (response.choices[0].message.content or "").strip()
     if not answer:
         raise RuntimeError("AI bo'sh javob qaytardi.")
 
@@ -256,47 +242,92 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
+    click_url = f"https://my.click.uz/services/pay?service_id=card&card_type=humo&card_number={CARD_NUMBER}&amount={QUESTION_PRICE_UZS}"
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(text="💳 Click orqali to‘lash (10 000 so‘m)", url=click_url)]
+    ])
+    
     text = (
-        f"💳 1 ta qo‘shimcha savol — {QUESTION_PRICE_UZS:,} so‘m.\n\n"
-        f"{PAYMENT_INSTRUCTIONS}\n\n"
-        f"To‘lov qilganda Telegram ID’ingizni ko‘rsating:\n"
-        f"`{update.effective_user.id}`\n\n"
-        f"To‘lov tasdiqlangach, balansingizga savol qo‘shiladi."
-    ).replace(",", " ")
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=MENU)
-
-async def addcredit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not ADMIN_TELEGRAM_ID or update.effective_user.id != ADMIN_TELEGRAM_ID:
-        await update.message.reply_text("Bu buyruq faqat administrator uchun.")
-        return
-
-    if len(context.args) != 2:
-        await update.message.reply_text("Format: /addcredit USER_ID SAVOL_SONI\nMasalan: /addcredit 123456789 1")
-        return
-
-    try:
-        user_id = int(context.args[0])
-        credits = int(context.args[1])
-        if credits <= 0 or credits > 1000:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("USER_ID va savol sonini to‘g‘ri kiriting.")
-        return
-
-    add_credits(user_id, credits)
-    amount = credits * QUESTION_PRICE_UZS
-    await update.message.reply_text(
-        f"✅ {user_id} foydalanuvchiga {credits} ta savol qo‘shildi "
-        f"({amount:,} so‘m).".replace(",", " ")
+        f"💳 *1 ta qo‘shimcha savol — 10 000 so‘m.*\n\n"
+        f"Karta raqam: `{CARD_NUMBER}` (Humo)\n\n"
+        f"1️⃣ Yuqoridagi tugmani bosib Click orqali to‘lang.\n"
+        f"2️⃣ To‘lov chekining rasmini (skrinshotini) shu botga yuboring.\n\n"
+        f"Tasdiqlangach, balansingizga avtomatik savol qo‘shiladi."
     )
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+async def handle_receipt_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update)
+    user = update.effective_user
+    photo = update.message.photo[-1]
+    
+    admin_keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(text="✅ Tasdiqlash (+1 savol)", callback_data=f"confirm_{user.id}"),
+            InlineKeyboardButton(text="❌ Rad etish", callback_data=f"reject_{user.id}")
+        ]
+    ])
+    
+    caption = (
+        f"🧾 <b>Yangi to‘lov cheki!</b>\n\n"
+        f"👤 Foydalanuvchi: {user.full_name}\n"
+        f"🆔 ID: <code>{user.id}</code>\n"
+        f"🔗 Username: @{user.username or 'mavjud_emas'}"
+    )
+    
     try:
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=f"✅ To‘lov tasdiqlandi. Balansingizga {credits} ta pullik savol qo‘shildi.",
-            reply_markup=MENU,
+        await context.bot.send_photo(
+            chat_id=ADMIN_TELEGRAM_ID,
+            photo=photo.file_id,
+            caption=caption,
+            reply_markup=admin_keyboard,
+            parse_mode="HTML"
         )
-    except Exception:
-        pass
+        await update.message.reply_text(
+            "✅ Chekingiz qabul qilindi. Administrator tez orada to‘lovni tasdiqlaydi.",
+            reply_markup=MENU
+        )
+    except Exception as e:
+        logger.error(f"Adminga chek yuborishda xatolik: {e}")
+        await update.message.reply_text("Chekni yuborishda xatolik yuz berdi. Qayta urinib ko'ring.")
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    if data.startswith("confirm_"):
+        user_id = int(data.split("_")[1])
+        add_credits(user_id, 1, note="Chek orqali tasdiqlandi")
+        
+        await query.edit_message_caption(
+            caption=query.message.caption + "\n\n✅ <b>To‘lov tasdiqlandi! +1 savol berildi.</b>",
+            parse_mode="HTML"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="🎉 To‘lovingiz tasdiqlandi! Balansingizga 1 ta pullik savol qo‘shildi. Savolingizni berishingiz mumkin.",
+                reply_markup=MENU
+            )
+        except Exception:
+            pass
+
+    elif data.startswith("reject_"):
+        user_id = int(data.split("_")[1])
+        await query.edit_message_caption(
+            caption=query.message.caption + "\n\n❌ <b>To‘lov rad etildi.</b>",
+            parse_mode="HTML"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="❌ To‘lov tasdiqlanmadi. Iltimos, chekni to‘g‘ri yuborganingizni tekshiring.",
+                reply_markup=MENU
+            )
+        except Exception:
+            pass
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     history[update.effective_chat.id].clear()
@@ -304,11 +335,11 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"Har kuni 1 ta savol bepul. Keyingi savollar {QUESTION_PRICE_UZS:,} so‘mdan.\n\n"
+        "Har kuni 1 ta savol bepul. Keyingi savollar 10 000 so‘mdan.\n\n"
         "/balance — balans\n"
         "/buy — savol sotib olish\n"
         "/myid — Telegram ID\n"
-        "/clear — suhbatni tozalash".replace(",", " "),
+        "/clear — suhbatni tozalash",
         reply_markup=MENU,
     )
 
@@ -350,19 +381,17 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     allowed, mode = can_ask(user_id)
     if not allowed:
         await update.message.reply_text(
-            f"🎁 Bugungi bepul savolingiz ishlatildi.\n\n"
-            f"Keyingi har bir savol — {QUESTION_PRICE_UZS:,} so‘m.\n"
-            f"To‘lov qilish uchun «💳 Savol sotib olish» tugmasini bosing.".replace(",", " "),
+            "🎁 Bugungi bepul savolingiz ishlatildi.\n\n"
+            "Keyingi har bir savol — 10 000 so‘m.\n"
+            "To‘lov qilish uchun «💳 Savol sotib olish» tugmasini bosing.",
             reply_markup=MENU,
         )
         return
 
-    # Savolni AI'ga yuborishdan oldin haqqini band qilamiz.
     consume_question(user_id, mode)
     await update.message.chat.send_action("typing")
 
     try:
-        import asyncio
         answer = await asyncio.to_thread(ask_openai, chat_id, mapped)
         remaining = get_account(user_id)["paid_credits"]
         suffix = (
@@ -395,7 +424,8 @@ def main():
     app.add_handler(CommandHandler("balance", balance))
     app.add_handler(CommandHandler("buy", buy))
     app.add_handler(CommandHandler("myid", myid))
-    app.add_handler(CommandHandler("addcredit", addcredit))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_receipt_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     logger.info("Kadastr AI bot ishga tushdi.")
@@ -403,3 +433,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
