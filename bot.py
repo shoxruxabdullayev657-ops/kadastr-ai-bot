@@ -1,24 +1,17 @@
 import os
 import logging
 import sqlite3
-import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from collections import defaultdict, deque
 
 from dotenv import load_dotenv
 from openai import OpenAI
-from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -27,19 +20,29 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna").strip()
+USE_WEB_SEARCH = os.getenv("USE_WEB_SEARCH", "true").lower() in {"1", "true", "yes", "on"}
 
-QUESTION_PRICE_UZS = 10000
-ADMIN_TELEGRAM_ID = 8324291242
-CARD_NUMBER = "9860060116463575"
+# Kunlik tarif: 1 ta bepul savoldan keyin 2 000 so'mga 10 ta qo'shimcha savol
+DAILY_PACK_PRICE_UZS = int(os.getenv("DAILY_PACK_PRICE_UZS", "2000"))
+DAILY_PACK_QUESTIONS = int(os.getenv("DAILY_PACK_QUESTIONS", "10"))
+
+# Sizning Telegram user ID'ingiz. /myid orqali bilib olishingiz mumkin.
+ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "0") or "0")
+
+# To'lov uchun ko'rsatma. Masalan karta raqami yoki Click/Payme havolasi.
+PAYMENT_INSTRUCTIONS = os.getenv(
+    "PAYMENT_INSTRUCTIONS",
+    "To'lov uchun administrator bilan bog'laning. Kunlik 10 ta qo'shimcha savol: 2 000 so'm."
+).strip()
 
 TZ = ZoneInfo("Asia/Samarkand")
 DB_PATH = os.getenv("DB_PATH", "kadastr_bot.db")
 
 if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN topilmadi.")
+    raise RuntimeError("TELEGRAM_BOT_TOKEN topilmadi. .env faylini tekshiring.")
 if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY topilmadi.")
+    raise RuntimeError("OPENAI_API_KEY topilmadi. .env faylini tekshiring.")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -49,22 +52,86 @@ logging.basicConfig(
 )
 logger = logging.getLogger("kadastr-bot")
 
-SYSTEM_PROMPT = """
-Siz O'zbekistondagi kadastr va ko'chmas mulk masalalari bo'yicha foydalanuvchiga
-oddiy, tushunarli o'zbek tilida yo'l-yo'riq beradigan "Kadastr AI" yordamchisiz.
+SYSTEM_PROMPT = r"""
+Siz “Kadastr AI” (@Kadastryordamchibot) nomli virtual yordamchisiz.
+Asosiy vazifangiz — O‘zbekiston Respublikasi fuqarolariga kadastr, ko‘chmas mulk,
+uy-joy, bino-inshoot va yer bilan bog‘liq masalalarni sodda, tushunarli va amaliy
+tarzda tushuntirish.
 
-ASOSIY VAZIFALAR:
-- Kadastr pasporti, davlat ro'yxatidan o'tkazish, mulk huquqi, uy-joy va yer
-  hujjatlari bo'yicha umumiy tartibni tushuntiring.
-- Foydalanuvchiga odatda kerak bo'lishi mumkin bo'lgan hujjatlarni sanab bering.
-- Holat noaniq bo'lsa, qisqa aniqlashtiruvchi savol bering.
-- Javobni qisqa, amaliy va bosqichma-bosqich yozing.
-- Foydalanuvchi rus tilida yozsa, rus tilida; o'zbek tilida yozsa, o'zbek tilida javob bering.
+TIL VA USLUB:
+- Foydalanuvchi o‘zbek tilida yozsa, o‘zbek tilida javob bering.
+- Foydalanuvchi rus tilida yozsa, rus tilida javob bering.
+- O‘zbekcha javoblarda sodda, tabiiy va hurmatli uslubdan foydalaning.
+- Ortiqcha rasmiyatchilik, keraksiz uzun kirish va takrorlardan qoching.
+- Avval qisqa xulosa bering, keyin amaliy qadamlarni ko‘rsating.
 
-MUHIM:
-- O'zingizni davlat organi yoki rasmiy kadastr xodimi deb ko'rsatmang.
-- Qonun, to'lov, muddat yoki talab o'zgarishi mumkin bo'lsa, buni ayting.
-- Zarur bo'lsa Kadastr agentligi, Davlat xizmatlari markazi yoki my.gov.uz manbalarini tavsiya qiling.
+ASOSIY YO‘NALISHLAR:
+- kadastr pasporti;
+- ko‘chmas mulkni davlat ro‘yxatidan o‘tkazish;
+- uy-joy va kvartira kadastri;
+- yer uchastkasi bilan bog‘liq masalalar;
+- bino va inshootlar;
+- mulk huquqini rasmiylashtirish;
+- meros yoki oldi-sotdidan keyingi rasmiylashtirish;
+- kadastrdagi xatolarni tuzatish;
+- yo‘qolgan yoki yangilanishi kerak bo‘lgan hujjatlar;
+- elektron davlat xizmatlari va rasmiy tekshiruvlar.
+
+ANIQLASHTIRISH QOIDASI:
+- Savolga to‘g‘ri javob berish uchun muhim ma’lumot yetishmasa, taxmin qilmang.
+- Bir yoki ikki qisqa aniqlashtiruvchi savol bering.
+- Masalan: “Gap uy, kvartira, bino yoki yer uchastkasi haqida ketyaptimi?”
+- Bir vaqtning o‘zida foydalanuvchini ko‘p savol bilan charchatmang.
+
+JAVOB FORMATI:
+Kerak bo‘lganda quyidagi tuzilmani ishlating, lekin har bir bo‘limni majburan qo‘shmang:
+
+✅ Qisqa javob:
+...
+
+📌 Nima qilish kerak:
+1. ...
+2. ...
+3. ...
+
+📄 Kerakli hujjatlar:
+• ...
+• ...
+
+📍 Qayerga murojaat qilish:
+...
+
+🔗 Rasmiy manba:
+...
+
+MUHIM FAKTLAR VA RASMIY MANBALAR:
+- Qonun, qaror, modda, davlat boji, xizmat narxi, jarima, muddat, telefon raqami,
+  manzil yoki talabni hech qachon o‘zingizdan to‘qib chiqarmang.
+- Bunday ma’lumotlar o‘zgarishi mumkin bo‘lsa, buni ochiq ayting.
+- Web qidiruv mavjud bo‘lsa, amaldagi ma’lumotlarni tekshirish uchun birinchi navbatda
+  rasmiy O‘zbekiston manbalaridan foydalaning: lex.uz, my.gov.uz, kadastr.uz va
+  tegishli davlat organlarining rasmiy saytlaridan.
+- Rasmiy manbada aniq javob topilmasa, “aniq tasdiqlangan ma’lumot topilmadi” deb ayting;
+  taxminni fakt sifatida bermang.
+- Muhim huquqiy yoki to‘lov/muddatga oid ma’lumot berganda imkon qadar rasmiy manbani
+  nomi bilan ko‘rsating va mavjud bo‘lsa havolasini keltiring.
+
+HUQUQIY CHEGARA:
+- O‘zingizni davlat organi, Kadastr agentligi xodimi yoki yurist deb ko‘rsatmang.
+- Murakkab nizo, sud, mulk talashuvi yoki katta huquqiy oqibatli vaziyatlarda umumiy
+  yo‘l-yo‘riq bering va kerak bo‘lsa tegishli davlat organi yoki malakali yuristga
+  murojaat qilishni tavsiya qiling.
+- Har bir oddiy javob oxirida avtomatik ravishda “yuristga boring” deb yozmang.
+
+MAXFIYLIK VA XAVFSIZLIK:
+- Pasport seriya-raqami, JShShIR/PINFL, bank karta raqami, CVV, parol, SMS tasdiqlash
+  kodi kabi maxfiy ma’lumotlarni so‘ramang.
+- Foydalanuvchi bunday ma’lumot yuborsa, uni qayta takrorlamang va keyingi xabarlarda
+  bunday maxfiy ma’lumotlarni yubormaslikni muloyim eslating.
+
+ASOSIY MAQSAD:
+Har bir javobdan keyin foydalanuvchi “Endi nima qilishim kerakligini tushundim” deya
+olishi kerak. Javobingiz foydalanuvchiga eng aniq keyingi qadamni ko‘rsatsin.
 """
 
 history = defaultdict(lambda: deque(maxlen=16))
@@ -79,14 +146,16 @@ MENU = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-WELCOME = """Assalomu alaykum! 👋
+WELCOME = f"""Assalomu alaykum! 👋
 
 Men Kadastr AI yordamchisiman.
 
 ✅ Har kuni 1 ta savol BEPUL.
-💳 Shu kundagi keyingi har bir savol: 10 000 so'm.
+💳 Keyin shu kun uchun {DAILY_PACK_QUESTIONS} ta qo‘shimcha savol: {DAILY_PACK_PRICE_UZS:,} so‘m.
 
-Savolingizni yozing yoki quyidagi menyudan tanlang."""
+Savolingizni yozing yoki menyudan tanlang.
+
+Eslatma: Kadastr AI — axborot va yo‘l-yo‘riq beruvchi yordamchi. Muhim huquqiy, to‘lov yoki muddatga oid ma’lumotlarda rasmiy manbani ham tekshiring.""".replace(",", " ")
 
 def db():
     conn = sqlite3.connect(DB_PATH)
@@ -101,9 +170,18 @@ def init_db():
                 username TEXT,
                 full_name TEXT,
                 paid_credits INTEGER NOT NULL DEFAULT 0,
-                free_used_date TEXT
+                free_used_date TEXT,
+                daily_pack_date TEXT,
+                daily_pack_remaining INTEGER NOT NULL DEFAULT 0
             )
         """)
+        # Eski bazani buzmasdan yangi kunlik paket ustunlarini qo‘shamiz.
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "daily_pack_date" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN daily_pack_date TEXT")
+        if "daily_pack_remaining" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN daily_pack_remaining INTEGER NOT NULL DEFAULT 0")
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -135,20 +213,29 @@ def ensure_user(update: Update):
 def get_account(user_id: int):
     with db() as conn:
         row = conn.execute(
-            "SELECT paid_credits, free_used_date FROM users WHERE user_id=?",
+            """SELECT paid_credits, free_used_date, daily_pack_date, daily_pack_remaining
+               FROM users WHERE user_id=?""",
             (user_id,)
         ).fetchone()
     if not row:
-        return {"paid_credits": 0, "free_used_date": None}
-    return dict(row)
+        return {
+            "paid_credits": 0,
+            "free_used_date": None,
+            "daily_pack_date": None,
+            "daily_pack_remaining": 0,
+        }
+    acc = dict(row)
+    if acc.get("daily_pack_date") != today_str():
+        acc["daily_pack_remaining"] = 0
+    return acc
 
 def can_ask(user_id: int):
     acc = get_account(user_id)
     free_available = acc["free_used_date"] != today_str()
     if free_available:
         return True, "free"
-    if acc["paid_credits"] > 0:
-        return True, "paid"
+    if acc["daily_pack_remaining"] > 0:
+        return True, "daily_pack"
     return False, "none"
 
 def consume_question(user_id: int, mode: str):
@@ -158,15 +245,15 @@ def consume_question(user_id: int, mode: str):
                 "UPDATE users SET free_used_date=? WHERE user_id=?",
                 (today_str(), user_id)
             )
-        elif mode == "paid":
+        elif mode == "daily_pack":
             cur = conn.execute(
                 """UPDATE users
-                   SET paid_credits = paid_credits - 1
-                   WHERE user_id=? AND paid_credits > 0""",
-                (user_id,)
+                   SET daily_pack_remaining = daily_pack_remaining - 1
+                   WHERE user_id=? AND daily_pack_date=? AND daily_pack_remaining > 0""",
+                (user_id, today_str())
             )
             if cur.rowcount != 1:
-                raise RuntimeError("Balans yetarli emas.")
+                raise RuntimeError("Bugungi paket savollari tugagan.")
         conn.commit()
 
 def refund_question(user_id: int, mode: str):
@@ -176,27 +263,35 @@ def refund_question(user_id: int, mode: str):
                 "UPDATE users SET free_used_date=NULL WHERE user_id=? AND free_used_date=?",
                 (user_id, today_str())
             )
-        elif mode == "paid":
+        elif mode == "daily_pack":
             conn.execute(
-                "UPDATE users SET paid_credits = paid_credits + 1 WHERE user_id=?",
-                (user_id,)
+                """UPDATE users
+                   SET daily_pack_remaining = daily_pack_remaining + 1
+                   WHERE user_id=? AND daily_pack_date=?""",
+                (user_id, today_str())
             )
         conn.commit()
 
-def add_credits(user_id: int, credits: int, note: str = "Admin tasdiqladi"):
-    amount = credits * QUESTION_PRICE_UZS
+def activate_daily_pack(user_id: int, note: str = "Admin tasdiqladi"):
     with db() as conn:
         conn.execute(
-            """INSERT INTO users(user_id, paid_credits)
-               VALUES(?, ?)
+            """INSERT INTO users(user_id, daily_pack_date, daily_pack_remaining)
+               VALUES(?, ?, ?)
                ON CONFLICT(user_id) DO UPDATE SET
-                 paid_credits = paid_credits + excluded.paid_credits""",
-            (user_id, credits)
+                 daily_pack_date=excluded.daily_pack_date,
+                 daily_pack_remaining=excluded.daily_pack_remaining""",
+            (user_id, today_str(), DAILY_PACK_QUESTIONS)
         )
         conn.execute(
             """INSERT INTO transactions(user_id, credits, amount_uzs, created_at, note)
                VALUES (?, ?, ?, ?, ?)""",
-            (user_id, credits, amount, datetime.now(TZ).isoformat(), note)
+            (
+                user_id,
+                DAILY_PACK_QUESTIONS,
+                DAILY_PACK_PRICE_UZS,
+                datetime.now(TZ).isoformat(),
+                note,
+            )
         )
         conn.commit()
 
@@ -204,23 +299,45 @@ def balance_text(user_id: int):
     acc = get_account(user_id)
     free_available = acc["free_used_date"] != today_str()
     return (
-        f"💰 Balansingiz:\n\n"
-        f"🎁 Bugungi bepul savol: {'mavjud ✅' if free_available else 'ishlatilgan ❌'}\n"
-        f"💳 Pullik savollar: {acc['paid_credits']} ta\n"
-        f"💵 1 ta qo‘shimcha savol: 10 000 so‘m"
+        f"💰 Bugungi holat:\n\n"
+        f"🎁 Bepul savol: {'mavjud ✅' if free_available else 'ishlatilgan ❌'}\n"
+        f"💳 Kunlik paket qoldig‘i: {acc['daily_pack_remaining']} ta\n"
+        f"💵 {DAILY_PACK_QUESTIONS} ta qo‘shimcha savol: {DAILY_PACK_PRICE_UZS:,} so‘m\n"
+        f"⏰ Paket faqat bugun amal qiladi."
+    ).replace(",", " ")
+
+def build_input(chat_id: int, user_text: str):
+    messages = list(history[chat_id])
+    messages.append({"role": "user", "content": user_text})
+    return messages
+
+
+def looks_like_sensitive_data(text: str) -> bool:
+    """Obvious secret/payment data patterns; avoids blocking ordinary cadastral numbers."""
+    import re
+    lowered = text.lower()
+    risky_words = (
+        "cvv", "cvc", "sms kod", "sms-kod", "tasdiqlash kodi",
+        "parol", "password", "karta raqami", "bank karta"
     )
+    if any(word in lowered for word in risky_words):
+        return bool(re.search(r"\d{3,19}", text))
+    # 16-digit payment-card-like sequence, with optional spaces/dashes.
+    digits = re.sub(r"\D", "", text)
+    return 16 <= len(digits) <= 19 and bool(re.search(r"(?:\d[ -]?){16,19}", text))
 
 def ask_openai(chat_id: int, user_text: str) -> str:
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    for msg in history[chat_id]:
-        messages.append(msg)
-    messages.append({"role": "user", "content": user_text})
+    kwargs = {
+        "model": OPENAI_MODEL,
+        "instructions": SYSTEM_PROMPT,
+        "input": build_input(chat_id, user_text),
+        "store": False,
+    }
+    if USE_WEB_SEARCH:
+        kwargs["tools"] = [{"type": "web_search"}]
 
-    response = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=messages,
-    )
-    answer = (response.choices[0].message.content or "").strip()
+    response = client.responses.create(**kwargs)
+    answer = (response.output_text or "").strip()
     if not answer:
         raise RuntimeError("AI bo'sh javob qaytardi.")
 
@@ -242,102 +359,52 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
-    payme_url = f"https://payme.uz/fallback/transfer/{CARD_NUMBER}"
-    
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(text="💳 Payme orqali to‘lash", url=payme_url)]
-    ])
-    
     text = (
-        f"💳 <b>1 ta qo‘shimcha savol — 10 000 so‘m</b>\n\n"
-        f"Karta raqami (nusxalash uchun ustiga bosing):\n"
-        f"👉 <code>{CARD_NUMBER}</code>\n\n"
-        f"1️⃣ Click yoki Payme orqali <b>10 000 so‘m</b> o‘tkazing.\n"
-        f"2️⃣ To‘lov chekini (rasm yoki fayl ko‘rinishida) shu botga yuboring.\n\n"
-        f"Tasdiqlangach, balansingizga avtomatik savol qo‘shiladi."
-    )
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+        f"💳 KUNLIK PAKET\n\n"
+        f"{DAILY_PACK_QUESTIONS} ta qo‘shimcha savol — {DAILY_PACK_PRICE_UZS:,} so‘m.\n"
+        f"Paket faqat bugun amal qiladi.\n\n"
+        f"{PAYMENT_INSTRUCTIONS}\n\n"
+        f"To‘lov qilganda Telegram ID’ingizni ko‘rsating:\n"
+        f"`{update.effective_user.id}`\n\n"
+        f"To‘lov tasdiqlangach, bugungi {DAILY_PACK_QUESTIONS} ta savol paketingiz faollashadi."
+    ).replace(",", " ")
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=MENU)
 
-async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ensure_user(update)
-    user = update.effective_user
-    
-    admin_keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(text="✅ Tasdiqlash (+1 savol)", callback_data=f"confirm_{user.id}"),
-            InlineKeyboardButton(text="❌ Rad etish", callback_data=f"reject_{user.id}")
-        ]
-    ])
-    
-    caption = (
-        f"🧾 <b>Yangi to‘lov cheki!</b>\n\n"
-        f"👤 Foydalanuvchi: {user.full_name}\n"
-        f"🆔 ID: <code>{user.id}</code>\n"
-        f"🔗 Username: @{user.username or 'mavjud_emas'}"
-    )
-    
-    try:
-        if update.message.photo:
-            await context.bot.send_photo(
-                chat_id=ADMIN_TELEGRAM_ID,
-                photo=update.message.photo[-1].file_id,
-                caption=caption,
-                reply_markup=admin_keyboard,
-                parse_mode="HTML"
-            )
-        elif update.message.document:
-            await context.bot.send_document(
-                chat_id=ADMIN_TELEGRAM_ID,
-                document=update.message.document.file_id,
-                caption=caption,
-                reply_markup=admin_keyboard,
-                parse_mode="HTML"
-            )
-        
+async def activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ADMIN_TELEGRAM_ID or update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("Bu buyruq faqat administrator uchun.")
+        return
+
+    if len(context.args) != 1:
         await update.message.reply_text(
-            "✅ Chekingiz qabul qilindi. Administrator tez orada to‘lovni tasdiqlaydi.",
-            reply_markup=MENU
+            "Format: /activate USER_ID\nMasalan: /activate 123456789"
         )
-    except Exception as e:
-        logger.error(f"Adminga chek yuborishda xatolik: {e}")
-        await update.message.reply_text("Chekni yuborishda xatolik yuz berdi. Qayta urinib ko'ring.")
+        return
 
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    data = query.data
-    if data.startswith("confirm_"):
-        user_id = int(data.split("_")[1])
-        add_credits(user_id, 1, note="Chek orqali tasdiqlandi")
-        
-        await query.edit_message_caption(
-            caption=query.message.caption + "\n\n✅ <b>To‘lov tasdiqlandi! +1 savol berildi.</b>",
-            parse_mode="HTML"
-        )
-        try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text="🎉 To‘lovingiz tasdiqlandi! Balansingizga 1 ta pullik savol qo‘shildi. Savolingizni berishingiz mumkin.",
-                reply_markup=MENU
-            )
-        except Exception:
-            pass
+    try:
+        user_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("USER_ID ni to‘g‘ri kiriting.")
+        return
 
-    elif data.startswith("reject_"):
-        user_id = int(data.split("_")[1])
-        await query.edit_message_caption(
-            caption=query.message.caption + "\n\n❌ <b>To‘lov rad etildi.</b>",
-            parse_mode="HTML"
+    activate_daily_pack(user_id)
+    await update.message.reply_text(
+        f"✅ {user_id} foydalanuvchiga bugun uchun "
+        f"{DAILY_PACK_QUESTIONS} ta savol paketi faollashtirildi "
+        f"({DAILY_PACK_PRICE_UZS:,} so‘m).".replace(",", " ")
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                f"✅ To‘lov tasdiqlandi!\n\n"
+                f"Bugun uchun {DAILY_PACK_QUESTIONS} ta qo‘shimcha savol ochildi.\n"
+                f"Paket bugun soat 23:59 gacha amal qiladi."
+            ),
+            reply_markup=MENU,
         )
-        try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text="❌ To‘lov tasdiqlanmadi. Iltimos, chekni to‘g‘ri yuborganingizni tekshiring.",
-                reply_markup=MENU
-            )
-        except Exception:
-            pass
+    except Exception:
+        pass
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     history[update.effective_chat.id].clear()
@@ -345,11 +412,12 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Har kuni 1 ta savol bepul. Keyingi savollar 10 000 so‘mdan.\n\n"
-        "/balance — balans\n"
-        "/buy — savol sotib olish\n"
+        f"Har kuni 1 ta savol bepul. Keyin bugun uchun {DAILY_PACK_QUESTIONS} ta savol — "
+        f"{DAILY_PACK_PRICE_UZS:,} so‘m.\n\n"
+        "/balance — bugungi qoldiq\n"
+        "/buy — kunlik paket sotib olish\n"
         "/myid — Telegram ID\n"
-        "/clear — suhbatni tozalash",
+        "/clear — suhbatni tozalash".replace(",", " "),
         reply_markup=MENU,
     )
 
@@ -388,26 +456,37 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await help_command(update, context)
         return
 
-    allowed, mode = can_ask(user_id)
-    if not allowed:
+    if looks_like_sensitive_data(mapped):
         await update.message.reply_text(
-            "🎁 Bugungi bepul savolingiz ishlatildi.\n\n"
-            "Keyingi har bir savol — 10 000 so‘m.\n"
-            "To‘lov qilish uchun «💳 Savol sotib olish» tugmasini bosing.",
+            "🔐 Xavfsizlik uchun karta raqami, CVV, parol yoki SMS kod kabi maxfiy "
+            "ma’lumotlarni botga yubormang. Savolingizni maxfiy raqamlarsiz qayta yozing.",
             reply_markup=MENU,
         )
         return
 
+    allowed, mode = can_ask(user_id)
+    if not allowed:
+        await update.message.reply_text(
+            f"🎁 Bugungi bepul savolingiz ishlatildi.\n\n"
+            f"💳 Bugun uchun {DAILY_PACK_QUESTIONS} ta qo‘shimcha savol — "
+            f"{DAILY_PACK_PRICE_UZS:,} so‘m.\n"
+            f"To‘lov qilish uchun «💳 Savol sotib olish» tugmasini bosing.".replace(",", " "),
+            reply_markup=MENU,
+        )
+        return
+
+    # Savolni AI'ga yuborishdan oldin haqqini band qilamiz.
     consume_question(user_id, mode)
     await update.message.chat.send_action("typing")
 
     try:
+        import asyncio
         answer = await asyncio.to_thread(ask_openai, chat_id, mapped)
-        remaining = get_account(user_id)["paid_credits"]
+        remaining = get_account(user_id)["daily_pack_remaining"]
         suffix = (
             "\n\n🎁 Bu bugungi bepul savolingiz edi."
             if mode == "free"
-            else f"\n\n💳 1 ta pullik savol ishlatildi. Qoldi: {remaining} ta."
+            else f"\n\n💳 Kunlik paketdan 1 ta savol ishlatildi. Bugungi qoldiq: {remaining} ta."
         )
         answer += suffix
 
@@ -434,8 +513,7 @@ def main():
     app.add_handler(CommandHandler("balance", balance))
     app.add_handler(CommandHandler("buy", buy))
     app.add_handler(CommandHandler("myid", myid))
-    app.add_handler(CallbackQueryHandler(button_callback))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_receipt))
+    app.add_handler(CommandHandler("activate", activate))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     logger.info("Kadastr AI bot ishga tushdi.")
