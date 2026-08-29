@@ -242,25 +242,25 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
-    click_url = f"https://my.click.uz/services/pay?service_id=card&card_type=humo&card_number={CARD_NUMBER}&amount={QUESTION_PRICE_UZS}"
+    payme_url = f"https://payme.uz/fallback/transfer/{CARD_NUMBER}"
     
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(text="💳 Click orqali to‘lash (10 000 so‘m)", url=click_url)]
+        [InlineKeyboardButton(text="💳 Payme orqali to‘lash", url=payme_url)]
     ])
     
     text = (
-        f"💳 *1 ta qo‘shimcha savol — 10 000 so‘m.*\n\n"
-        f"Karta raqam: `{CARD_NUMBER}` (Humo)\n\n"
-        f"1️⃣ Yuqoridagi tugmani bosib Click orqali to‘lang.\n"
-        f"2️⃣ To‘lov chekining rasmini (skrinshotini) shu botga yuboring.\n\n"
+        f"💳 <b>1 ta qo‘shimcha savol — 10 000 so‘m</b>\n\n"
+        f"Karta raqami (nusxalash uchun ustiga bosing):\n"
+        f"👉 <code>{CARD_NUMBER}</code>\n\n"
+        f"1️⃣ Click yoki Payme orqali <b>10 000 so‘m</b> o‘tkazing.\n"
+        f"2️⃣ To‘lov chekini (rasm yoki fayl ko‘rinishida) shu botga yuboring.\n\n"
         f"Tasdiqlangach, balansingizga avtomatik savol qo‘shiladi."
     )
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
-async def handle_receipt_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
     user = update.effective_user
-    photo = update.message.photo[-1]
     
     admin_keyboard = InlineKeyboardMarkup([
         [
@@ -277,13 +277,23 @@ async def handle_receipt_photo(update: Update, context: ContextTypes.DEFAULT_TYP
     )
     
     try:
-        await context.bot.send_photo(
-            chat_id=ADMIN_TELEGRAM_ID,
-            photo=photo.file_id,
-            caption=caption,
-            reply_markup=admin_keyboard,
-            parse_mode="HTML"
-        )
+        if update.message.photo:
+            await context.bot.send_photo(
+                chat_id=ADMIN_TELEGRAM_ID,
+                photo=update.message.photo[-1].file_id,
+                caption=caption,
+                reply_markup=admin_keyboard,
+                parse_mode="HTML"
+            )
+        elif update.message.document:
+            await context.bot.send_document(
+                chat_id=ADMIN_TELEGRAM_ID,
+                document=update.message.document.file_id,
+                caption=caption,
+                reply_markup=admin_keyboard,
+                parse_mode="HTML"
+            )
+        
         await update.message.reply_text(
             "✅ Chekingiz qabul qilindi. Administrator tez orada to‘lovni tasdiqlaydi.",
             reply_markup=MENU
@@ -425,7 +435,7 @@ def main():
     app.add_handler(CommandHandler("buy", buy))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CallbackQueryHandler(button_callback))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_receipt_photo))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_receipt))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     logger.info("Kadastr AI bot ishga tushdi.")
@@ -433,5 +443,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
